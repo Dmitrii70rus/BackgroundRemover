@@ -21,6 +21,8 @@ enum BackgroundRemovalProcessorError: LocalizedError {
 
 struct BackgroundRemovalProcessor {
     private let ciContext = CIContext(options: nil)
+    private let minimumMaskCoverage = 0.01
+
 
     func removeBackground(from image: UIImage) throws -> UIImage {
         guard let normalizedCGImage = normalizedCGImage(from: image) else {
@@ -66,7 +68,12 @@ struct BackgroundRemovalProcessor {
                 height: CVPixelBufferGetHeight(maskBuffer)
             )
 
-            return ciContext.createCGImage(CIImage(cvPixelBuffer: maskBuffer), from: maskExtent)
+            guard let mask = ciContext.createCGImage(CIImage(cvPixelBuffer: maskBuffer), from: maskExtent),
+                  hasUsableCoverage(mask) else {
+                return nil
+            }
+
+            return mask
         } catch {
             return nil
         }
@@ -94,7 +101,40 @@ struct BackgroundRemovalProcessor {
 
         mask = mask.cropped(to: input.extent)
 
-        return ciContext.createCGImage(mask, from: input.extent)
+        guard let cgMask = ciContext.createCGImage(mask, from: input.extent),
+              hasUsableCoverage(cgMask) else {
+            return nil
+        }
+
+        return cgMask
+    }
+
+
+    private func hasUsableCoverage(_ mask: CGImage) -> Bool {
+        let ciMask = CIImage(cgImage: mask)
+        guard let avgFilter = CIFilter(name: "CIAreaAverage") else {
+            return true
+        }
+
+        avgFilter.setValue(ciMask, forKey: kCIInputImageKey)
+        avgFilter.setValue(CIVector(cgRect: ciMask.extent), forKey: kCIInputExtentKey)
+
+        guard let output = avgFilter.outputImage else {
+            return true
+        }
+
+        var pixel = [UInt8](repeating: 0, count: 4)
+        ciContext.render(
+            output,
+            toBitmap: &pixel,
+            rowBytes: 4,
+            bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+            format: .RGBA8,
+            colorSpace: CGColorSpaceCreateDeviceRGB()
+        )
+
+        let coverage = Double(pixel[0]) / 255.0
+        return coverage >= minimumMaskCoverage
     }
 
     private func normalizedCGImage(from image: UIImage) -> CGImage? {
