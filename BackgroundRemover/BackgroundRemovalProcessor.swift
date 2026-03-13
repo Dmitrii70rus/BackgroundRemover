@@ -21,78 +21,108 @@ enum BackgroundRemovalProcessorError: LocalizedError {
 
 struct BackgroundRemovalProcessor {
     private let ciContext = CIContext(options: nil)
-    private let minimumMaskCoverage = 0.01
-    private let maximumMaskCoverage = 0.995
+
+    // Keep validation permissive enough for close-up portraits and tall selfies.
+    private let minimumMaskCoverage = 0.003
+    private let maximumMaskCoverage = 0.9995
 
     func removeBackground(from image: UIImage) throws -> UIImage {
-        guard let normalizedCGImage = normalizedCGImage(from: image) else {
-            throw BackgroundRemovalProcessorError.unsupportedImage
-        }
+        let input = try validatedInput(from: image)
 
-        guard let mask = makeSubjectMask(for: normalizedCGImage) else {
+        guard let subjectMask = extractSubjectMask(
+            cgImage: input.cgImage,
+            orientation: input.orientation
+        ) else {
             throw BackgroundRemovalProcessorError.noSubjectFound
         }
 
-        let cutout = renderTransparentCutout(image: normalizedCGImage, mask: mask)
+        guard let cutout = compositeCutout(
+            image: input.cgImage,
+            mask: subjectMask
+        ) else {
+            throw BackgroundRemovalProcessorError.processingFailed
+        }
+
         return UIImage(cgImage: cutout, scale: image.scale, orientation: .up)
     }
 
-    private func makeSubjectMask(for image: CGImage) -> CGImage? {
-        foregroundInstanceMask(for: image)
-            ?? personSegmentationMask(for: image)
-            ?? saliencyMask(for: image, attentionBased: true)
-            ?? saliencyMask(for: image, attentionBased: false)
+    // MARK: - Input
+
+    private func validatedInput(from image: UIImage) throws -> (cgImage: CGImage, orientation: CGImagePropertyOrientation) {
+        if let cgImage = image.cgImage {
+            return (cgImage, CGImagePropertyOrientation(image.imageOrientation))
+        }
+
+        if let ciImage = image.ciImage,
+           let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) {
+            return (cgImage, CGImagePropertyOrientation(image.imageOrientation))
+        }
+
+        throw BackgroundRemovalProcessorError.unsupportedImage
     }
 
-    private func foregroundInstanceMask(for image: CGImage) -> CGImage? {
+    // MARK: - Subject extraction
+
+    private func extractSubjectMask(cgImage: CGImage, orientation: CGImagePropertyOrientation) -> CGImage? {
+        foregroundInstanceMask(cgImage: cgImage, orientation: orientation)
+            ?? personSegmentationMask(cgImage: cgImage, orientation: orientation)
+            ?? saliencyMask(cgImage: cgImage, orientation: orientation, attentionBased: true)
+            ?? saliencyMask(cgImage: cgImage, orientation: orientation, attentionBased: false)
+    }
+
+    private func foregroundInstanceMask(cgImage: CGImage, orientation: CGImagePropertyOrientation) -> CGImage? {
         let request = VNGenerateForegroundInstanceMaskRequest()
-        request.usesCPUOnly = true
-        let handler = VNImageRequestHandler(cgImage: image, options: [:])
+        let handler = VNImageRequestHandler(cgImage: cgImage, orientation: orientation, options: [:])
 
         do {
             try handler.perform([request])
-            guard let observation = request.results?.first else {
-                return nil
-            }
+            guard let observation = request.results?.first else { return nil }
 
-            let allInstances = observation.allInstances
-            guard !allInstances.isEmpty else {
-                return nil
-            }
+            let instances = observation.allInstances
+            guard !instances.isEmpty else { return nil }
 
-            let maskBuffer = try observation.generateScaledMaskForImage(forInstances: allInstances, from: handler)
-            return makeValidatedMask(from: maskBuffer)
+            let maskBuffer = try observation.generateScaledMaskForImage(forInstances: instances, from: handler)
+            return validatedMask(
+                from: maskBuffer,
+                targetWidth: cgImage.width,
+                targetHeight: cgImage.height
+            )
         } catch {
             return nil
         }
     }
 
-    private func personSegmentationMask(for image: CGImage) -> CGImage? {
+    private func personSegmentationMask(cgImage: CGImage, orientation: CGImagePropertyOrientation) -> CGImage? {
         let request = VNGeneratePersonSegmentationRequest()
-        request.qualityLevel = .balanced
+        request.qualityLevel = .accurate
         request.outputPixelFormat = kCVPixelFormatType_OneComponent8
-        request.usesCPUOnly = true
-        let handler = VNImageRequestHandler(cgImage: image, options: [:])
+
+        let handler = VNImageRequestHandler(cgImage: cgImage, orientation: orientation, options: [:])
 
         do {
             try handler.perform([request])
-            guard let result = request.results?.first else {
-                return nil
-            }
+            guard let result = request.results?.first else { return nil }
 
-            return makeValidatedMask(from: result.pixelBuffer)
+            return validatedMask(
+                from: result.pixelBuffer,
+                targetWidth: cgImage.width,
+                targetHeight: cgImage.height
+            )
         } catch {
             return nil
         }
     }
 
-    private func saliencyMask(for image: CGImage, attentionBased: Bool) -> CGImage? {
+    private func saliencyMask(
+        cgImage: CGImage,
+        orientation: CGImagePropertyOrientation,
+        attentionBased: Bool
+    ) -> CGImage? {
         let request: VNImageBasedRequest = attentionBased
             ? VNGenerateAttentionBasedSaliencyImageRequest()
             : VNGenerateObjectnessBasedSaliencyImageRequest()
-        request.usesCPUOnly = true
 
-        let handler = VNImageRequestHandler(cgImage: image, options: [:])
+        let handler = VNImageRequestHandler(cgImage: cgImage, orientation: orientation, options: [:])
 
         do {
             try handler.perform([request])
@@ -103,36 +133,49 @@ struct BackgroundRemovalProcessor {
                 observation = (request as? VNGenerateObjectnessBasedSaliencyImageRequest)?.results?.first
             }
 
-            guard let pixelBuffer = observation?.pixelBuffer else {
-                return nil
-            }
+            guard let pixelBuffer = observation?.pixelBuffer else { return nil }
 
-            return makeValidatedMask(from: pixelBuffer)
+            return validatedMask(
+                from: pixelBuffer,
+                targetWidth: cgImage.width,
+                targetHeight: cgImage.height
+            )
         } catch {
             return nil
         }
     }
 
-    private func makeValidatedMask(from pixelBuffer: CVPixelBuffer) -> CGImage? {
-        let extent = CGRect(
-            x: 0,
-            y: 0,
-            width: CVPixelBufferGetWidth(pixelBuffer),
-            height: CVPixelBufferGetHeight(pixelBuffer)
-        )
+    // MARK: - Mask processing
 
-        let ciMask = CIImage(cvPixelBuffer: pixelBuffer)
-        let normalizedMask = normalizeMask(ciMask).cropped(to: extent)
+    private func validatedMask(from pixelBuffer: CVPixelBuffer, targetWidth: Int, targetHeight: Int) -> CGImage? {
+        let maskImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let maskExtent = maskImage.extent
 
-        guard let mask = ciContext.createCGImage(normalizedMask, from: extent),
-              hasUsableCoverage(mask) else {
+        guard maskExtent.width > 0, maskExtent.height > 0 else {
             return nil
         }
 
-        return mask
+        let scaledMask = maskImage.transformed(
+            by: CGAffineTransform(
+                scaleX: CGFloat(targetWidth) / maskExtent.width,
+                y: CGFloat(targetHeight) / maskExtent.height
+            )
+        )
+        .cropped(to: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
+
+        let preparedMask = normalizedMask(scaledMask)
+
+        guard let maskCGImage = ciContext.createCGImage(
+            preparedMask,
+            from: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight)
+        ), hasUsableCoverage(maskCGImage) else {
+            return nil
+        }
+
+        return maskCGImage
     }
 
-    private func normalizeMask(_ mask: CIImage) -> CIImage {
+    private func normalizedMask(_ mask: CIImage) -> CIImage {
         guard let controls = CIFilter(name: "CIColorControls") else {
             return mask
         }
@@ -140,21 +183,21 @@ struct BackgroundRemovalProcessor {
         controls.setValue(mask, forKey: kCIInputImageKey)
         controls.setValue(1.0, forKey: kCIInputSaturationKey)
         controls.setValue(0.0, forKey: kCIInputBrightnessKey)
-        controls.setValue(1.25, forKey: kCIInputContrastKey)
+        controls.setValue(1.2, forKey: kCIInputContrastKey)
 
         return controls.outputImage ?? mask
     }
 
     private func hasUsableCoverage(_ mask: CGImage) -> Bool {
         let ciMask = CIImage(cgImage: mask)
-        guard let avgFilter = CIFilter(name: "CIAreaAverage") else {
+        guard let areaAverage = CIFilter(name: "CIAreaAverage") else {
             return true
         }
 
-        avgFilter.setValue(ciMask, forKey: kCIInputImageKey)
-        avgFilter.setValue(CIVector(cgRect: ciMask.extent), forKey: kCIInputExtentKey)
+        areaAverage.setValue(ciMask, forKey: kCIInputImageKey)
+        areaAverage.setValue(CIVector(cgRect: ciMask.extent), forKey: kCIInputExtentKey)
 
-        guard let output = avgFilter.outputImage else {
+        guard let output = areaAverage.outputImage else {
             return true
         }
 
@@ -172,24 +215,9 @@ struct BackgroundRemovalProcessor {
         return coverage >= minimumMaskCoverage && coverage <= maximumMaskCoverage
     }
 
-    private func normalizedCGImage(from image: UIImage) -> CGImage? {
-        if image.imageOrientation == .up, let cgImage = image.cgImage {
-            return cgImage
-        }
+    // MARK: - Compositing
 
-        let format = UIGraphicsImageRendererFormat.default()
-        format.opaque = false
-        format.scale = 1
-
-        let renderer = UIGraphicsImageRenderer(size: image.size, format: format)
-        let normalizedImage = renderer.image { _ in
-            image.draw(in: CGRect(origin: .zero, size: image.size))
-        }
-
-        return normalizedImage.cgImage
-    }
-
-    private func renderTransparentCutout(image: CGImage, mask: CGImage) -> CGImage {
+    private func compositeCutout(image: CGImage, mask: CGImage) -> CGImage? {
         let size = CGSize(width: image.width, height: image.height)
         let format = UIGraphicsImageRendererFormat.default()
         format.opaque = false
@@ -203,6 +231,31 @@ struct BackgroundRemovalProcessor {
             context.cgContext.draw(image, in: rect)
         }
 
-        return rendered.cgImage ?? image
+        return rendered.cgImage
+    }
+}
+
+private extension CGImagePropertyOrientation {
+    init(_ orientation: UIImage.Orientation) {
+        switch orientation {
+        case .up:
+            self = .up
+        case .down:
+            self = .down
+        case .left:
+            self = .left
+        case .right:
+            self = .right
+        case .upMirrored:
+            self = .upMirrored
+        case .downMirrored:
+            self = .downMirrored
+        case .leftMirrored:
+            self = .leftMirrored
+        case .rightMirrored:
+            self = .rightMirrored
+        @unknown default:
+            self = .up
+        }
     }
 }
