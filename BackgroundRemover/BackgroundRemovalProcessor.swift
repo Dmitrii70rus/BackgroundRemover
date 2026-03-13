@@ -12,7 +12,7 @@ enum BackgroundRemovalProcessorError: LocalizedError {
         case .unsupportedImage:
             return "This image format is not supported for background removal."
         case .noSubjectFound:
-            return "We couldn't find a clear subject in this photo. Try another image."
+            return "We couldn't isolate a clear subject in this image. Try a photo with one person or object in the foreground."
         case .processingFailed:
             return "Background removal failed. Please try again."
         }
@@ -38,11 +38,10 @@ struct BackgroundRemovalProcessor {
     }
 
     private func makeSubjectMask(for image: CGImage) -> CGImage? {
-        if let mask = foregroundInstanceMask(for: image) {
-            return mask
-        }
-
-        return personSegmentationMask(for: image)
+        foregroundInstanceMask(for: image)
+            ?? personSegmentationMask(for: image)
+            ?? saliencyMask(for: image, attentionBased: true)
+            ?? saliencyMask(for: image, attentionBased: false)
     }
 
     private func foregroundInstanceMask(for image: CGImage) -> CGImage? {
@@ -87,6 +86,33 @@ struct BackgroundRemovalProcessor {
         }
     }
 
+    private func saliencyMask(for image: CGImage, attentionBased: Bool) -> CGImage? {
+        let request: VNImageBasedRequest = attentionBased
+            ? VNGenerateAttentionBasedSaliencyImageRequest()
+            : VNGenerateObjectnessBasedSaliencyImageRequest()
+        request.usesCPUOnly = true
+
+        let handler = VNImageRequestHandler(cgImage: image, options: [:])
+
+        do {
+            try handler.perform([request])
+            let observation: VNSaliencyImageObservation?
+            if attentionBased {
+                observation = (request as? VNGenerateAttentionBasedSaliencyImageRequest)?.results?.first
+            } else {
+                observation = (request as? VNGenerateObjectnessBasedSaliencyImageRequest)?.results?.first
+            }
+
+            guard let pixelBuffer = observation?.pixelBuffer else {
+                return nil
+            }
+
+            return makeValidatedMask(from: pixelBuffer)
+        } catch {
+            return nil
+        }
+    }
+
     private func makeValidatedMask(from pixelBuffer: CVPixelBuffer) -> CGImage? {
         let extent = CGRect(
             x: 0,
@@ -95,12 +121,28 @@ struct BackgroundRemovalProcessor {
             height: CVPixelBufferGetHeight(pixelBuffer)
         )
 
-        guard let mask = ciContext.createCGImage(CIImage(cvPixelBuffer: pixelBuffer), from: extent),
+        let ciMask = CIImage(cvPixelBuffer: pixelBuffer)
+        let normalizedMask = normalizeMask(ciMask).cropped(to: extent)
+
+        guard let mask = ciContext.createCGImage(normalizedMask, from: extent),
               hasUsableCoverage(mask) else {
             return nil
         }
 
         return mask
+    }
+
+    private func normalizeMask(_ mask: CIImage) -> CIImage {
+        guard let controls = CIFilter(name: "CIColorControls") else {
+            return mask
+        }
+
+        controls.setValue(mask, forKey: kCIInputImageKey)
+        controls.setValue(1.0, forKey: kCIInputSaturationKey)
+        controls.setValue(0.0, forKey: kCIInputBrightnessKey)
+        controls.setValue(1.25, forKey: kCIInputContrastKey)
+
+        return controls.outputImage ?? mask
     }
 
     private func hasUsableCoverage(_ mask: CGImage) -> Bool {
