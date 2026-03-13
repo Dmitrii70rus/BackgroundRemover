@@ -22,7 +22,7 @@ enum BackgroundRemovalProcessorError: LocalizedError {
 struct BackgroundRemovalProcessor {
     private let ciContext = CIContext(options: nil)
     private let minimumMaskCoverage = 0.01
-
+    private let maximumMaskCoverage = 0.995
 
     func removeBackground(from image: UIImage) throws -> UIImage {
         guard let normalizedCGImage = normalizedCGImage(from: image) else {
@@ -38,15 +38,16 @@ struct BackgroundRemovalProcessor {
     }
 
     private func makeSubjectMask(for image: CGImage) -> CGImage? {
-        if let visionMask = visionMask(for: image) {
-            return visionMask
+        if let mask = foregroundInstanceMask(for: image) {
+            return mask
         }
 
         return personSegmentationMask(for: image)
     }
 
-    private func visionMask(for image: CGImage) -> CGImage? {
+    private func foregroundInstanceMask(for image: CGImage) -> CGImage? {
         let request = VNGenerateForegroundInstanceMaskRequest()
+        request.usesCPUOnly = true
         let handler = VNImageRequestHandler(cgImage: image, options: [:])
 
         do {
@@ -61,54 +62,46 @@ struct BackgroundRemovalProcessor {
             }
 
             let maskBuffer = try observation.generateScaledMaskForImage(forInstances: allInstances, from: handler)
-            let maskExtent = CGRect(
-                x: 0,
-                y: 0,
-                width: CVPixelBufferGetWidth(maskBuffer),
-                height: CVPixelBufferGetHeight(maskBuffer)
-            )
-
-            guard let mask = ciContext.createCGImage(CIImage(cvPixelBuffer: maskBuffer), from: maskExtent),
-                  hasUsableCoverage(mask) else {
-                return nil
-            }
-
-            return mask
+            return makeValidatedMask(from: maskBuffer)
         } catch {
             return nil
         }
     }
 
     private func personSegmentationMask(for image: CGImage) -> CGImage? {
-        let input = CIImage(cgImage: image)
+        let request = VNGeneratePersonSegmentationRequest()
+        request.qualityLevel = .balanced
+        request.outputPixelFormat = kCVPixelFormatType_OneComponent8
+        request.usesCPUOnly = true
+        let handler = VNImageRequestHandler(cgImage: image, options: [:])
 
-        guard let filter = CIFilter(name: "CIPersonSegmentation") else {
+        do {
+            try handler.perform([request])
+            guard let result = request.results?.first else {
+                return nil
+            }
+
+            return makeValidatedMask(from: result.pixelBuffer)
+        } catch {
             return nil
         }
-
-        filter.setValue(input, forKey: kCIInputImageKey)
-        filter.setValue(1, forKey: "inputQualityLevel")
-
-        guard var mask = filter.outputImage else {
-            return nil
-        }
-
-        if mask.extent.size != input.extent.size {
-            let scaleX = input.extent.width / mask.extent.width
-            let scaleY = input.extent.height / mask.extent.height
-            mask = mask.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
-        }
-
-        mask = mask.cropped(to: input.extent)
-
-        guard let cgMask = ciContext.createCGImage(mask, from: input.extent),
-              hasUsableCoverage(cgMask) else {
-            return nil
-        }
-
-        return cgMask
     }
 
+    private func makeValidatedMask(from pixelBuffer: CVPixelBuffer) -> CGImage? {
+        let extent = CGRect(
+            x: 0,
+            y: 0,
+            width: CVPixelBufferGetWidth(pixelBuffer),
+            height: CVPixelBufferGetHeight(pixelBuffer)
+        )
+
+        guard let mask = ciContext.createCGImage(CIImage(cvPixelBuffer: pixelBuffer), from: extent),
+              hasUsableCoverage(mask) else {
+            return nil
+        }
+
+        return mask
+    }
 
     private func hasUsableCoverage(_ mask: CGImage) -> Bool {
         let ciMask = CIImage(cgImage: mask)
@@ -134,7 +127,7 @@ struct BackgroundRemovalProcessor {
         )
 
         let coverage = Double(pixel[0]) / 255.0
-        return coverage >= minimumMaskCoverage
+        return coverage >= minimumMaskCoverage && coverage <= maximumMaskCoverage
     }
 
     private func normalizedCGImage(from image: UIImage) -> CGImage? {
