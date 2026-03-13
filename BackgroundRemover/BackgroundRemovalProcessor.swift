@@ -40,7 +40,7 @@ struct BackgroundRemovalProcessor {
             throw BackgroundRemovalProcessorError.noSubjectFound
         }
 
-        let allInstances = IndexSet(integersIn: 1...observation.instanceCount)
+        let allInstances = observation.allInstances
         if allInstances.isEmpty {
             throw BackgroundRemovalProcessorError.noSubjectFound
         }
