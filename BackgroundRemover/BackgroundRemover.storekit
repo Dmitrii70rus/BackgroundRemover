@@ -1,0 +1,36 @@
+{
+  "identifier" : "B5E10C8C-32FA-4E06-9EA4-B89EEB95C961",
+  "nonRenewingSubscriptions" : [
+
+  ],
+  "products" : [
+    {
+      "displayPrice" : "4.99",
+      "familyShareable" : false,
+      "internalID" : "E2CC10B6-6EC2-4C3C-B085-089AE7B6A6C1",
+      "localizations" : [
+        {
+          "description" : "Unlock unlimited background removals forever.",
+          "displayName" : "Premium Unlock",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "backgroundremover.premium.unlock",
+      "referenceName" : "Premium Unlock",
+      "type" : "NonConsumable"
+    }
+  ],
+  "settings" : {
+    "_applicationInternalID" : "C6A8120A-0A6D-42C2-9E96-FC8F6D07A18F",
+    "_developerTeamID" : "PTJB973W8B",
+    "_storefront" : "USA",
+    "_timeRate" : 0
+  },
+  "subscriptionGroups" : [
+
+  ],
+  "version" : {
+    "major" : 3,
+    "minor" : 0
+  }
+}
