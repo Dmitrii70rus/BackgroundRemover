@@ -4,6 +4,7 @@ import Vision
 
 enum BackgroundRemovalProcessorError: LocalizedError {
     case unsupportedImage
+    case simulatorUnsupported
     case noSubjectFound
     case processingFailed
 
@@ -11,6 +12,8 @@ enum BackgroundRemovalProcessorError: LocalizedError {
         switch self {
         case .unsupportedImage:
             return "This image format is not supported for background removal."
+        case .simulatorUnsupported:
+            return "Background removal may be unavailable in Simulator. Please test on a real device."
         case .noSubjectFound:
             return "We couldn't isolate a clear subject in this image. Try a photo with one person or object in the foreground."
         case .processingFailed:
@@ -22,24 +25,17 @@ enum BackgroundRemovalProcessorError: LocalizedError {
 struct BackgroundRemovalProcessor {
     private let ciContext = CIContext(options: nil)
 
-    // Keep validation permissive enough for close-up portraits and tall selfies.
     private let minimumMaskCoverage = 0.003
     private let maximumMaskCoverage = 0.9995
 
     func removeBackground(from image: UIImage) throws -> UIImage {
         let input = try validatedInput(from: image)
-
-        guard let subjectMask = extractSubjectMask(
+        let subjectMask = try extractSubjectMask(
             cgImage: input.cgImage,
             orientation: input.orientation
-        ) else {
-            throw BackgroundRemovalProcessorError.noSubjectFound
-        }
+        )
 
-        guard let cutout = compositeCutout(
-            image: input.cgImage,
-            mask: subjectMask
-        ) else {
+        guard let cutout = compositeCutout(image: input.cgImage, mask: subjectMask) else {
             throw BackgroundRemovalProcessorError.processingFailed
         }
 
@@ -63,36 +59,95 @@ struct BackgroundRemovalProcessor {
 
     // MARK: - Subject extraction
 
-    private func extractSubjectMask(cgImage: CGImage, orientation: CGImagePropertyOrientation) -> CGImage? {
-        foregroundInstanceMask(cgImage: cgImage, orientation: orientation)
-            ?? personSegmentationMask(cgImage: cgImage, orientation: orientation)
-            ?? saliencyMask(cgImage: cgImage, orientation: orientation, attentionBased: true)
-            ?? saliencyMask(cgImage: cgImage, orientation: orientation, attentionBased: false)
+    private func extractSubjectMask(cgImage: CGImage, orientation: CGImagePropertyOrientation) throws -> CGImage {
+        var hadRuntimeLimitation = false
+        var hadProcessingError = false
+
+        for request in extractionRequests {
+            switch run(request: request, cgImage: cgImage, orientation: orientation) {
+            case .success(let mask):
+                if let mask {
+                    return mask
+                }
+            case .failure(let error):
+                if isRuntimeLimitationError(error) {
+                    hadRuntimeLimitation = true
+                } else {
+                    hadProcessingError = true
+                }
+            }
+        }
+
+#if targetEnvironment(simulator)
+        if hadRuntimeLimitation {
+            throw BackgroundRemovalProcessorError.simulatorUnsupported
+        }
+#endif
+
+        if hadProcessingError {
+            throw BackgroundRemovalProcessorError.processingFailed
+        }
+
+        throw BackgroundRemovalProcessorError.noSubjectFound
     }
 
-    private func foregroundInstanceMask(cgImage: CGImage, orientation: CGImagePropertyOrientation) -> CGImage? {
+    private var extractionRequests: [ExtractionRequest] {
+        [
+            .foregroundInstance,
+            .personSegmentation,
+            .attentionSaliency,
+            .objectnessSaliency
+        ]
+    }
+
+    private func run(
+        request: ExtractionRequest,
+        cgImage: CGImage,
+        orientation: CGImagePropertyOrientation
+    ) -> Result<CGImage?, Error> {
+        switch request {
+        case .foregroundInstance:
+            return foregroundInstanceMask(cgImage: cgImage, orientation: orientation)
+        case .personSegmentation:
+            return personSegmentationMask(cgImage: cgImage, orientation: orientation)
+        case .attentionSaliency:
+            return saliencyMask(cgImage: cgImage, orientation: orientation, attentionBased: true)
+        case .objectnessSaliency:
+            return saliencyMask(cgImage: cgImage, orientation: orientation, attentionBased: false)
+        }
+    }
+
+    private func foregroundInstanceMask(
+        cgImage: CGImage,
+        orientation: CGImagePropertyOrientation
+    ) -> Result<CGImage?, Error> {
         let request = VNGenerateForegroundInstanceMaskRequest()
         let handler = VNImageRequestHandler(cgImage: cgImage, orientation: orientation, options: [:])
 
         do {
             try handler.perform([request])
-            guard let observation = request.results?.first else { return nil }
+            guard let observation = request.results?.first else { return .success(nil) }
 
             let instances = observation.allInstances
-            guard !instances.isEmpty else { return nil }
+            guard !instances.isEmpty else { return .success(nil) }
 
             let maskBuffer = try observation.generateScaledMaskForImage(forInstances: instances, from: handler)
-            return validatedMask(
-                from: maskBuffer,
-                targetWidth: cgImage.width,
-                targetHeight: cgImage.height
+            return .success(
+                validatedMask(
+                    from: maskBuffer,
+                    targetWidth: cgImage.width,
+                    targetHeight: cgImage.height
+                )
             )
         } catch {
-            return nil
+            return .failure(error)
         }
     }
 
-    private func personSegmentationMask(cgImage: CGImage, orientation: CGImagePropertyOrientation) -> CGImage? {
+    private func personSegmentationMask(
+        cgImage: CGImage,
+        orientation: CGImagePropertyOrientation
+    ) -> Result<CGImage?, Error> {
         let request = VNGeneratePersonSegmentationRequest()
         request.qualityLevel = .accurate
         request.outputPixelFormat = kCVPixelFormatType_OneComponent8
@@ -101,15 +156,17 @@ struct BackgroundRemovalProcessor {
 
         do {
             try handler.perform([request])
-            guard let result = request.results?.first else { return nil }
+            guard let result = request.results?.first else { return .success(nil) }
 
-            return validatedMask(
-                from: result.pixelBuffer,
-                targetWidth: cgImage.width,
-                targetHeight: cgImage.height
+            return .success(
+                validatedMask(
+                    from: result.pixelBuffer,
+                    targetWidth: cgImage.width,
+                    targetHeight: cgImage.height
+                )
             )
         } catch {
-            return nil
+            return .failure(error)
         }
     }
 
@@ -117,7 +174,7 @@ struct BackgroundRemovalProcessor {
         cgImage: CGImage,
         orientation: CGImagePropertyOrientation,
         attentionBased: Bool
-    ) -> CGImage? {
+    ) -> Result<CGImage?, Error> {
         let request: VNImageBasedRequest = attentionBased
             ? VNGenerateAttentionBasedSaliencyImageRequest()
             : VNGenerateObjectnessBasedSaliencyImageRequest()
@@ -133,16 +190,26 @@ struct BackgroundRemovalProcessor {
                 observation = (request as? VNGenerateObjectnessBasedSaliencyImageRequest)?.results?.first
             }
 
-            guard let pixelBuffer = observation?.pixelBuffer else { return nil }
+            guard let pixelBuffer = observation?.pixelBuffer else { return .success(nil) }
 
-            return validatedMask(
-                from: pixelBuffer,
-                targetWidth: cgImage.width,
-                targetHeight: cgImage.height
+            return .success(
+                validatedMask(
+                    from: pixelBuffer,
+                    targetWidth: cgImage.width,
+                    targetHeight: cgImage.height
+                )
             )
         } catch {
-            return nil
+            return .failure(error)
         }
+    }
+
+    private func isRuntimeLimitationError(_ error: Error) -> Bool {
+        let message = (error as NSError).localizedDescription.lowercased()
+        return message.contains("espresso context")
+            || message.contains("e5rt is not supported")
+            || message.contains("could not perform the vision request")
+            || message.contains("unsupported")
     }
 
     // MARK: - Mask processing
@@ -233,6 +300,13 @@ struct BackgroundRemovalProcessor {
 
         return rendered.cgImage
     }
+}
+
+private enum ExtractionRequest {
+    case foregroundInstance
+    case personSegmentation
+    case attentionSaliency
+    case objectnessSaliency
 }
 
 private extension CGImagePropertyOrientation {
